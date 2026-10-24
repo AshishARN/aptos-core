@@ -50,6 +50,18 @@ use std::{
 };
 use thread_local::ThreadLocal;
 
+use aptos_sdk::move_types::parser::parse_type_tag;
+
+#[derive(serde::Deserialize, Clone)]
+struct CustomJsonTxn {
+    sender_idx: usize,
+    module_address: String,
+    module_name: String,
+    function_name: String,
+    ty_args: Vec<String>, // Uncomment later if you need generic type arguments
+    args_bcs: Vec<String>,
+}
+
 const META_FILENAME: &str = "metadata.toml";
 pub const MAX_ACCOUNTS_INVOLVED_IN_P2P: usize = 1_000_000;
 
@@ -686,6 +698,138 @@ impl TransactionGenerator {
         num_blocks: usize,
         transactions_per_sender: usize,
     ) {
+        // OVERRIDE 1: Check for JSON-defined arbitrary transactions
+        if let Ok(filepath) = std::env::var("CUSTOM_JSON_FILE") {
+            let num_accounts = self.main_signer_accounts.as_ref().unwrap().accounts.len();
+            
+            // 🔥 Print Account 0 so we know where to deploy our Move module!
+            println!("🔥 DEPLOYMENT ADDRESS (ACCOUNT 0): {}", self.main_signer_accounts.as_ref().unwrap().accounts[0].address().to_hex_literal());
+            
+            if let Ok(contents) = std::fs::read_to_string(&filepath) {
+                let json_txns: Vec<CustomJsonTxn> = serde_json::from_str(&contents).expect("Invalid JSON");
+                aptos_logger::info!("Loaded {} custom JSON txns", json_txns.len());
+                
+                let mut global_idx = 0; // Linear tracker
+                
+                for _ in 0..num_blocks {
+                    let mut final_txns = Vec::with_capacity(block_size);
+                    for _ in 0..block_size {
+                        final_txns.push(json_txns[global_idx % json_txns.len()].clone());
+                        global_idx += 1;
+                    }
+                    
+                    self.generate_and_send_block(
+                        self.main_signer_accounts.as_ref().unwrap(),
+                        final_txns,
+                        std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                        std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                        |json_txn, account_cache| {
+                            let sender = &account_cache.accounts[json_txn.sender_idx % num_accounts];
+                            // Dynamically resolve module_address just like we do for args!
+                            let module_addr = if json_txn.module_address.starts_with("ACCOUNT:") {
+                                let idx: usize = json_txn.module_address["ACCOUNT:".len()..].parse().expect("Invalid account index");
+                                account_cache.accounts[idx % num_accounts].address()
+                            } else {
+                                AccountAddress::from_hex_literal(&json_txn.module_address).expect("Invalid module address hex")
+                            };
+
+                            let module_id = move_core_types::language_storage::ModuleId::new(
+                                module_addr,
+                                move_core_types::identifier::Identifier::new(json_txn.module_name).unwrap(),
+                            );
+                            let function = move_core_types::identifier::Identifier::new(json_txn.function_name).unwrap();
+                            
+                            let mut parsed_ty_args = Vec::new();
+                            for ty_str in json_txn.ty_args {
+                                parsed_ty_args.push(parse_type_tag(&ty_str).expect("Invalid type tag string"));
+                            }
+
+                            let mut args = Vec::new();
+                            for arg_str in json_txn.args_bcs {
+                                if arg_str.starts_with("ACCOUNT:") {
+                                    let idx: usize = arg_str["ACCOUNT:".len()..].parse().expect("Invalid account index");
+                                    let actual_addr = account_cache.accounts[idx % num_accounts].address();
+                                    args.push(bcs::to_bytes(&actual_addr).unwrap());
+                                } else {
+                                    args.push(hex::decode(&arg_str).expect("Invalid hex in args_bcs"));
+                                }
+                            }
+                            
+                            let payload = aptos_types::transaction::TransactionPayload::EntryFunction(
+                                aptos_types::transaction::EntryFunction::new(module_id, function, parsed_ty_args, args)
+                            );
+                            
+                            let txn = sender.sign_with_transaction_builder(self.transaction_factory.payload(payload));
+                            Some(aptos_types::transaction::Transaction::UserTransaction(txn))
+                        },
+                        |(json_txn)| json_txn.sender_idx % num_accounts,
+                    );
+                }
+                return; 
+            }
+        }
+        
+        // OVERRIDE 2: Check for custom DAG CSV (Your existing code)
+        if let Ok(filepath) = std::env::var("CUSTOM_DAG_FILE") {
+            let num_accounts = self.main_signer_accounts.as_ref().unwrap().accounts.len();
+            if let Ok(contents) = std::fs::read_to_string(&filepath) {
+                let mut file_indices = Vec::new();
+                for line in contents.lines() {
+                    let parts: Vec<&str> = line.split(',').collect();
+                    if parts.len() >= 2 {
+                        if let Ok(s) = parts[0].trim().parse::<usize>() {
+                            let mut receivers = Vec::new();
+                            for i in 1..parts.len() {
+                                if let Ok(r) = parts[i].trim().parse::<usize>() {
+                                    receivers.push(r % num_accounts);
+                                }
+                            }
+                            file_indices.push((s % num_accounts, receivers));
+                        }
+                    }
+                }
+                
+                if !file_indices.is_empty() {
+                    aptos_logger::info!("Loaded {} custom rules from {}", file_indices.len(), filepath);
+                    for _ in 0..num_blocks {
+                        let mut final_indices = Vec::with_capacity(block_size);
+                        for i in 0..block_size {
+                            final_indices.push(file_indices[i % file_indices.len()].clone());
+                        }
+                        self.generate_and_send_block(
+                            self.main_signer_accounts.as_ref().unwrap(),
+                            final_indices,
+                            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                            |(sender_idx, receiver_indices), account_cache| {
+                                let sender = &account_cache.accounts[sender_idx];
+                                let payload = if receiver_indices.len() == 1 {
+                                    aptos_sdk::transaction_builder::aptos_stdlib::aptos_account_transfer(
+                                        account_cache.accounts[receiver_indices[0]].address(),
+                                        1,
+                                    )
+                                } else {
+                                    // BATCH TRANSFER: Multiple receivers!
+                                    let receivers: Vec<_> = receiver_indices.iter()
+                                        .map(|&idx| account_cache.accounts[idx].address())
+                                        .collect();
+                                    let amounts = vec![1; receivers.len()];
+                                    aptos_sdk::transaction_builder::aptos_stdlib::aptos_account_batch_transfer(receivers, amounts)
+                                };
+                                let txn = sender.sign_with_transaction_builder(
+                                    self.transaction_factory.payload(payload)
+                                );
+                                Some(aptos_types::transaction::Transaction::UserTransaction(txn))
+                            },
+                            |(sender_idx, _)| *sender_idx,
+                        );
+                    }
+                    return; // Skip default generation
+                }
+            }
+        }
+
+        // DEFAULT BEHAVIOR
         for _ in 0..num_blocks {
             let transfer_indices =
                 self.get_random_transfer_indices(block_size, transactions_per_sender);
@@ -701,7 +845,34 @@ impl TransactionGenerator {
         block_size: usize,
         transactions_per_sender: usize,
     ) -> Vec<(usize, usize)> {
-        // TODO: handle when block_size isn't divisible by transactions_per_sender
+        let num_accounts = self.main_signer_accounts.as_ref().unwrap().accounts.len();
+        
+        if let Ok(shape) = std::env::var("CUSTOM_DAG_SHAPE") {
+            let mut indices = Vec::with_capacity(block_size);
+            match shape.as_str() {
+                "waterfall" => {
+                    for i in 0..block_size {
+                        indices.push((i % num_accounts, (i + 1) % num_accounts));
+                    }
+                    return indices;
+                }
+                "bottleneck" => {
+                    let half = block_size / 2;
+                    for i in 1..=half { indices.push((i % num_accounts, 0)); }
+                    for i in 1..=(block_size - half) { indices.push((0, i % num_accounts)); }
+                    return indices;
+                }
+                "fan-out" => {
+                    for i in 1..=block_size {
+                        indices.push((0, i % num_accounts));
+                    }
+                    return indices;
+                }
+                _ => aptos_logger::info!("Unknown CUSTOM_DAG_SHAPE '{}', falling back to default", shape),
+            }
+        }
+
+        // 3. THE DEFAULT BEHAVIOR
         (0..(block_size / transactions_per_sender))
             .flat_map(|_| {
                 let (sender, receivers) = self

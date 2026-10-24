@@ -28,6 +28,7 @@ use crate::{
     types::ReadWriteSummary,
     view::{LatestView, ParallelState, SequentialState, ViewState},
 };
+use rayon::prelude::*;
 use aptos_aggregator::{
     delayed_change::{ApplyBase, DelayedChange},
     delta_change_set::serialize,
@@ -79,6 +80,7 @@ use std::{
 };
 use triomphe::Arc as TriompheArc;
 
+#[derive(Copy, Clone)]
 struct SharedSyncParams<'a, T, E, S>
 where
     T: BlockExecutableTransaction,
@@ -854,14 +856,32 @@ where
         // (i.e. not re-execute unless some other part of the validation fails or
         // until commit, but mark as estimates).
 
-        read_set.validate_data_reads(versioned_cache.data(), idx_to_validate)
-            && read_set.validate_group_reads(versioned_cache.group_data(), idx_to_validate)
-            && (skip_module_reads_validation
-                || read_set.validate_module_reads(
-                    global_module_cache,
-                    versioned_cache.module_cache(),
-                    None,
-                ))
+        let data_ok   = read_set.validate_data_reads(versioned_cache.data(), idx_to_validate);
+        let group_ok  = read_set.validate_group_reads(versioned_cache.group_data(), idx_to_validate);
+        let module_ok = skip_module_reads_validation
+            || read_set.validate_module_reads(
+                global_module_cache,
+                versioned_cache.module_cache(),
+                None,
+            );
+
+        if !data_ok || !group_ok || !module_ok {
+            eprintln!(
+                "[DAG-VALIDATE-FAIL] txn={} data_ok={} group_ok={} module_ok={}",
+                idx_to_validate, data_ok, group_ok, module_ok
+            );
+        }
+
+        data_ok && group_ok && module_ok
+
+        // read_set.validate_data_reads(versioned_cache.data(), idx_to_validate)
+        //     && read_set.validate_group_reads(versioned_cache.group_data(), idx_to_validate)
+        //     && (skip_module_reads_validation
+        //         || read_set.validate_module_reads(
+        //             global_module_cache,
+        //             versioned_cache.module_cache(),
+        //             None,
+        //         ))
     }
 
     fn update_on_validation(
@@ -1201,6 +1221,7 @@ where
             // in V2 is needed for a different, code cache implementation related reason.
             true,
         ) {
+            eprintln!("[DAG-VALIDATE-FAIL] FINAL VALIDATION FAILED txn={}", txn_idx);
             return Err(code_invariant_error(format!(
                 "Final Validation in post-processing failed for txn {}",
                 txn_idx
@@ -2644,14 +2665,587 @@ where
         Ok(BlockOutput::new(ret, block_epilogue_txn))
     }
 
+    pub(crate) fn execute_transactions_dag(
+        &self,
+        signature_verified_block: &TP,
+        base_view: &S,
+        transaction_slice_metadata: &TransactionSliceMetadata,
+        module_cache_manager_guard: &mut AptosModuleCacheManagerGuard,
+        waves: Vec<Vec<usize>>,
+        out_edges: Vec<Vec<usize>>,
+        in_degrees_raw: Vec<usize>,
+    ) -> Result<BlockOutput<T, E::Output>, ()> {
+        let _timer = PARALLEL_EXECUTION_SECONDS.start_timer();
+        
+        let num_txns = signature_verified_block.num_txns();
+        if num_txns == 0 {
+            return Ok(BlockOutput::new(vec![], None));
+        }
+
+        let mut versioned_cache = MVHashMap::new();
+        let start_shared_counter = gen_id_start_value(false);
+        let shared_counter = AtomicU32::new(start_shared_counter);
+        let block_limit_processor = ExplicitSyncWrapper::new(BlockGasLimitProcessor::new(
+            self.config.onchain.block_gas_limit_type.clone(),
+            self.config.onchain.block_gas_limit_override(),
+            num_txns + 1,
+        ));
+        
+        let final_results = ExplicitSyncWrapper::new(
+            (0..(num_txns + 1))
+                .map(|_| E::Output::skip_output())
+                .collect::<Vec<_>>(),
+        );
+        let block_epilogue_txn_idx = ExplicitSyncWrapper::new(None);
+        let num_txns_u32 = num_txns as u32;
+        let skip_module_reads_validation = AtomicBool::new(true);
+        let last_input_output = TxnLastInputOutput::new(num_txns_u32 + 1);
+        let scheduler = Scheduler::new(num_txns_u32);
+
+        let shared_sync_params: SharedSyncParams<'_, T, E, S> = SharedSyncParams {
+            base_view,
+            versioned_cache: &versioned_cache,
+            global_module_cache: module_cache_manager_guard.module_cache(),
+            last_input_output: &last_input_output,
+            delayed_field_id_counter: &shared_counter,
+            start_shared_counter,
+            block_limit_processor: &block_limit_processor,
+            final_results: &final_results,
+            maybe_block_epilogue_txn_idx: &block_epilogue_txn_idx,
+        };
+
+        let num_workers = self.config.local.concurrency_level.min(num_txns).max(1);
+        let async_runtime_checks_enabled = should_perform_async_runtime_checks_for_block(
+            module_cache_manager_guard.environment(),
+            num_txns as u32,
+            num_workers as u32,
+        );
+
+        let environment = module_cache_manager_guard.environment();
+        let runtime_environment = environment.runtime_environment();
+        let scheduler_wrapper = SchedulerWrapper::V1(&scheduler, &skip_module_reads_validation);
+        let block_gas_limit_type = self.config.onchain.block_gas_limit_type.clone();
+
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let has_reconfig = AtomicBool::new(false);
+        let global_cache_ref = module_cache_manager_guard.module_cache();
+        
+        // ---------------------------------------------------------
+        // DAG WORKER POOL EXECUTION (USING PAR_ITER)
+        // ---------------------------------------------------------
+        use std::sync::atomic::{AtomicUsize};
+
+        // ---------------------------------------------------------
+        // FINE-GRAINED DAG TASK-QUEUE SCHEDULER
+        //
+        // True task-queue dispatch: each transaction is dispatched the instant
+        // all its DAG predecessors finish — no wave barrier.
+        //
+        // Uses std::thread::scope (stable since Rust 1.63) which allows spawned
+        // threads to borrow non-'static stack variables. This is the key that
+        // rayon::scope couldn't provide: we can have multiple OS threads running
+        // concurrently (workers + committer) while all borrowing stack-allocated
+        // executor state like versioned_cache, last_input_output, environment etc.
+        //
+        // Architecture:
+        //   Worker threads: pull from a concurrent queue (crossbeam SegQueue),
+        //     execute their transaction, write results into versioned_cache and
+        //     last_input_output, then atomically decrement successor in-degrees
+        //     and push any newly-ready successors back onto the queue.
+        //     Finally, send the completed index on done_tx.
+        //
+        //   Committer thread: receives completed indices, maintains a BTreeSet,
+        //     and drains in strict ascending order — the only correct order for
+        //     validate_and_commit_delayed_fields.
+        //
+        //   No wave barriers. Workers keep running as long as the queue is
+        //   non-empty. The committer runs concurrently, overlapping commit work
+        //   with execution of the next batch of transactions.
+        // ---------------------------------------------------------
+
+        // Use the exact edges computed during DAG construction — no reconstruction needed.
+        let successors_fg: Vec<Vec<usize>> = out_edges;
+        let in_degrees_fg: Vec<AtomicUsize> = in_degrees_raw
+            .into_iter()
+            .map(AtomicUsize::new)
+            .collect();
+
+        // truncate_at: if a reconfig or SkipRest fires, workers set this to the txn's
+        // index so successors beyond that point are not pushed onto the queue.
+        let truncate_at = AtomicUsize::new(num_txns);
+        use crossbeam::deque::{Injector, Stealer, Worker as DequeWorker};
+        let injector: Injector<usize> = Injector::new();
+        let mut worker_deques: Vec<DequeWorker<usize>> = (0..num_workers)
+            .map(|_| DequeWorker::new_fifo())
+            .collect();
+        let stealers: Vec<Stealer<usize>> = worker_deques.iter().map(|w| w.stealer()).collect();
+
+        let mut already_seeded = vec![false; num_txns];
+        already_seeded[0] = true; 
+        
+        let mut initial_ready = 0usize;
+        for &succ in &successors_fg[0] {
+            if in_degrees_fg[succ].fetch_sub(1, Ordering::AcqRel) == 1 {
+                injector.push(succ);
+                already_seeded[succ] = true;
+                initial_ready += 1;
+            }
+        }
+        for i in 1..num_txns {
+            if !already_seeded[i] && in_degrees_fg[i].load(Ordering::Relaxed) == 0 {
+                injector.push(i);
+                initial_ready += 1;
+            }
+        }
+
+        let done_flags: Vec<AtomicBool> = (0..num_txns).map(|_| AtomicBool::new(false)).collect();
+        use std::sync::Condvar;
+        let commit_signal = (std::sync::Mutex::new(()), Condvar::new());
+        let pending_workers = AtomicUsize::new(initial_ready);
+
+        let injector_ref = &injector;
+        let stealers_ref = &stealers[..];
+        let successors_ref = &successors_fg;
+        let in_degrees_ref = &in_degrees_fg;
+        let truncate_ref = &truncate_at;
+        let pending_ref = &pending_workers;
+        let done_flags_ref = &done_flags;
+        let commit_signal_ref = &commit_signal;
+        let versioned_cache_ref = &versioned_cache;
+        let last_input_output_ref = &last_input_output;
+        let has_reconfig_ref = &has_reconfig;
+        let shared_counter_ref = &shared_counter;
+
+        // Pre-execute txn 0
+        {
+            let txn_idx_0: TxnIndex = 0;
+            let parallel_state_0 = ParallelState::new(
+                &versioned_cache,
+                scheduler_wrapper.clone(),
+                start_shared_counter,
+                &shared_counter,
+                0,
+            );
+            let sync_view_0 = LatestView::new(
+                base_view,
+                global_cache_ref,
+                runtime_environment,
+                ViewState::Sync(parallel_state_0),
+                txn_idx_0,
+            );
+            let txn_0 = signature_verified_block.get_txn(txn_idx_0);
+            let aux_info_0 = signature_verified_block.get_auxiliary_info(txn_idx_0);
+            let executor_0 = E::init(&environment, base_view, async_runtime_checks_enabled);
+            let execution_result_0 = executor_0.execute_transaction(
+                &sync_view_0, txn_0, &aux_info_0, txn_idx_0,
+            );
+            let mut read_set_0 = sync_view_0.take_parallel_reads();
+            let (processed_output_0, _is_spec_fail_0) =
+                Self::process_execution_result(&execution_result_0, &mut read_set_0, txn_idx_0)
+                    .expect("[DAG] BlockMetadata pre-execution: process_execution_result failed");
+
+            Self::process_delayed_field_output(
+                processed_output_0, txn_idx_0, &mut read_set_0,
+                &last_input_output, &versioned_cache, false,
+            ).expect("[DAG] BlockMetadata pre-execution: process_delayed_field_output failed");
+
+            if let Some(output_0) = processed_output_0 {
+                let g = output_0.before_materialization().unwrap();
+                for (gk, (gm, gs, go)) in g.resource_group_write_set() {
+                    versioned_cache.data().write_metadata(gk.clone(), txn_idx_0, 0, gm);
+                    versioned_cache.group_data().write(
+                        gk, txn_idx_0, 0, go.into_iter(), gs, HashSet::new(),
+                    ).unwrap();
+                }
+                for (k, (v, l)) in g.resource_write_set() {
+                    versioned_cache.data().write(k, txn_idx_0, 0, v, l).unwrap();
+                }
+                for (k, v) in g.aggregator_v1_write_set() {
+                    versioned_cache.data().write(k, txn_idx_0, 0, TriompheArc::new(v), None).unwrap();
+                }
+                for (k, d) in g.aggregator_v1_delta_set() {
+                    versioned_cache.data().add_delta(k, txn_idx_0, d);
+                }
+            }
+
+            last_input_output.record(
+                txn_idx_0, read_set_0, execution_result_0,
+                &block_gas_limit_type,
+                txn_0.user_txn_bytes_len() as u64,
+            ).expect("[DAG] BlockMetadata pre-execution: record failed");
+
+            Self::validate_and_commit_delayed_fields(txn_idx_0, &versioned_cache, &last_input_output, false).unwrap();
+            self.materialize_txn_commit(txn_idx_0, scheduler_wrapper.clone(), &environment, &shared_sync_params).unwrap();
+            self.record_finalized_output(txn_idx_0, txn_idx_0, &shared_sync_params).unwrap();
+
+            done_flags[0].store(true, Ordering::Release);
+        }
+
+        let commits_done_out = AtomicUsize::new(0);
+        let commits_done_out_ref = &commits_done_out;
+        let params_ref = &shared_sync_params;
+
+        let explicit_sync_lock = std::sync::Mutex::new(());
+
+        let t_scope_start = std::time::Instant::now();
+
+        std::thread::scope(|s| {
+            // WORKERS
+            for worker_local in worker_deques {
+                s.spawn(move || {
+                    let find_task = || -> Option<usize> {
+                        worker_local.pop()
+                            .or_else(|| loop {
+                                match injector_ref.steal_batch_and_pop(&worker_local) {
+                                    crossbeam::deque::Steal::Success(t) => break Some(t),
+                                    crossbeam::deque::Steal::Retry   => continue,
+                                    crossbeam::deque::Steal::Empty    => break None,
+                                }
+                            })
+                            .or_else(|| {
+                                stealers_ref.iter().find_map(|st| loop {
+                                    match st.steal_batch_and_pop(&worker_local) {
+                                        crossbeam::deque::Steal::Success(t) => break Some(t),
+                                        crossbeam::deque::Steal::Retry   => continue,
+                                        crossbeam::deque::Steal::Empty    => break None,
+                                    }
+                                })
+                            })
+                    };
+                    
+                    let executor = E::init(&environment, base_view, async_runtime_checks_enabled);
+                    let mut backoff = crossbeam::utils::Backoff::new();
+                    
+                    loop {
+                        if let Some(txn_i) = find_task() {
+                            backoff.reset();
+                            let txn_idx = txn_i as TxnIndex;
+                            let did_execute = txn_i <= truncate_ref.load(Ordering::Acquire);
+                            
+                            let mut should_truncate = false;
+                            
+                            if did_execute {
+                                let parallel_state = ParallelState::new(
+                                    versioned_cache_ref, scheduler_wrapper.clone(),
+                                    start_shared_counter, shared_counter_ref, 0,
+                                );
+                                let sync_view = LatestView::new(
+                                    base_view, global_cache_ref, runtime_environment,
+                                    ViewState::Sync(parallel_state), txn_idx,
+                                );
+                                let txn = signature_verified_block.get_txn(txn_idx);
+                                let aux_info = signature_verified_block.get_auxiliary_info(txn_idx);
+                                let execution_result = executor.execute_transaction(
+                                    &sync_view, txn, &aux_info, txn_idx,
+                                );
+                                let mut read_set = sync_view.take_parallel_reads();
+                                let (processed_output, is_speculative_failure) =
+                                    Self::process_execution_result(&execution_result, &mut read_set, txn_idx)
+                                        .unwrap();
+                                
+                                if let ExecutionStatus::SkipRest(_) = &execution_result {
+                                    should_truncate = true;
+                                }
+                                if is_speculative_failure {
+                                    last_input_output_ref.record_speculative_failure(txn_idx);
+                                    should_truncate = true;
+                                } else {
+                                    Self::process_delayed_field_output(
+                                        processed_output, txn_idx, &mut read_set,
+                                        last_input_output_ref, versioned_cache_ref, false,
+                                    ).unwrap();
+                                    
+                                    if let Some(output) = processed_output {
+                                        let g = output.before_materialization().unwrap();
+                                        if g.has_new_epoch_event() {
+                                            should_truncate = true;
+                                            has_reconfig_ref.store(true, Ordering::Release);
+                                        }
+                                        for (gk, (gm, gs, go)) in g.resource_group_write_set() {
+                                            versioned_cache_ref.data().write_metadata(gk.clone(), txn_idx, 0, gm);
+                                            versioned_cache_ref.group_data().write(
+                                                gk, txn_idx, 0, go.into_iter(), gs, HashSet::new(),
+                                            ).unwrap();
+                                        }
+                                        for (k, (v, l)) in g.resource_write_set() {
+                                            versioned_cache_ref.data().write(k, txn_idx, 0, v, l).unwrap();
+                                        }
+                                        for (k, v) in g.aggregator_v1_write_set() {
+                                            versioned_cache_ref.data().write(
+                                                k, txn_idx, 0, TriompheArc::new(v), None,
+                                            ).unwrap();
+                                        }
+                                        for (k, d) in g.aggregator_v1_delta_set() {
+                                            versioned_cache_ref.data().add_delta(k, txn_idx, d);
+                                        }
+                                    }
+                                    last_input_output_ref.record(
+                                        txn_idx, read_set, execution_result,
+                                        &block_gas_limit_type, txn.user_txn_bytes_len() as u64,
+                                    ).unwrap();
+                                }
+                            }
+
+                            if should_truncate {
+                                truncate_ref.fetch_min(txn_i, Ordering::Release);
+                            }
+
+                            let current_truncate = truncate_ref.load(Ordering::Acquire);
+                            let mut newly_ready = 0usize;
+                            for &succ in &successors_ref[txn_i] {
+                                if in_degrees_ref[succ].fetch_sub(1, Ordering::AcqRel) == 1 {
+                                    if succ <= current_truncate {
+                                        worker_local.push(succ);
+                                        newly_ready += 1;
+                                    }
+                                }
+                            }
+
+                            if newly_ready > 0 {
+                                pending_ref.fetch_add(newly_ready, Ordering::AcqRel);
+                            }
+
+                            if did_execute {
+                                done_flags_ref[txn_i].store(true, Ordering::Release);
+                                let _g = commit_signal_ref.0.lock().unwrap();
+                                commit_signal_ref.1.notify_one();
+                            }
+
+                            if pending_ref.fetch_sub(1, Ordering::AcqRel) == 1 {
+                                let _g = commit_signal_ref.0.lock().unwrap();
+                                commit_signal_ref.1.notify_one();
+                                return;
+                            }
+
+                        } else {
+                            if pending_ref.load(Ordering::Acquire) == 0 {
+                                break;
+                            }
+                            
+                            if backoff.is_completed() {
+                                std::thread::yield_now();
+                            } else {
+                                backoff.snooze();
+                            }
+                        }
+                    }
+                });
+            }
+
+            // MATERIALIZE WORKERS
+            let (mat_tx, mat_rx) = crossbeam::channel::unbounded::<TxnIndex>();
+
+            // FIX: Unleash all available workers for materialization!
+            let num_mat_workers = num_workers; 
+            for _ in 0..num_mat_workers {
+                let mat_rx = mat_rx.clone();
+                // Pass a reference to the lock into the closure
+                let lock_ref = &explicit_sync_lock; 
+                s.spawn(move || {
+                    for txn_idx in &mat_rx {
+                        self.materialize_txn_commit(
+                            txn_idx, scheduler_wrapper.clone(), environment, params_ref,
+                        ).unwrap();
+                        // Lock the UnsafeCells for the nanoseconds it takes to write to them
+                        let _guard = lock_ref.lock().unwrap();
+                        self.record_finalized_output(txn_idx, txn_idx, params_ref).unwrap();
+
+                        if block_gas_limit_type.conflict_penalty_window().is_none() {
+                            let final_results = params_ref.final_results.acquire();
+                            let output = &final_results[txn_idx as usize];
+                            if output.is_materialized_and_success() {
+                                if let Ok(after_guard) = output.after_materialization() {
+                                    let fee = after_guard.fee_statement();
+                                    // --- THE FIX ---
+                                                let approx_output_size = block_gas_limit_type
+                                                    .block_output_limit()
+                                                    .map(|_| 0);
+                                    params_ref.block_limit_processor.acquire()
+                                        .accumulate_fee_statement(fee, None, approx_output_size);
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+            drop(mat_rx); 
+
+            // COMMITTER THREAD
+            let lock_ref = &explicit_sync_lock;
+            s.spawn(move || {
+                let mut next_to_commit_fg = 1usize;
+                loop {
+                    if next_to_commit_fg >= num_txns { break; }
+                    
+                    if done_flags_ref[next_to_commit_fg].load(Ordering::Acquire) {
+                        let txn_idx = next_to_commit_fg as TxnIndex;
+                        
+                        Self::validate_and_commit_delayed_fields(
+                            txn_idx, versioned_cache_ref, last_input_output_ref, false,
+                        ).unwrap();
+
+                        {
+                            // Protect the UnsafeCells here too!
+                            let _guard = lock_ref.lock().unwrap();
+                            let mut limit_guard = params_ref.block_limit_processor.acquire();
+                            last_input_output_ref.commit(
+                                txn_idx,
+                                num_txns as u32,
+                                num_workers as usize,
+                                &mut limit_guard,
+                                params_ref.maybe_block_epilogue_txn_idx,
+                                &scheduler_wrapper,
+                            ).unwrap();
+                        }
+                        
+                        mat_tx.send(txn_idx).unwrap();
+                        next_to_commit_fg += 1;
+                    } else {
+                        if pending_ref.load(Ordering::Acquire) == 0 {
+                            break;
+                        }
+                        let guard = commit_signal_ref.0.lock().unwrap();
+                        if !done_flags_ref[next_to_commit_fg].load(Ordering::Acquire) {
+                            let _ = commit_signal_ref.1.wait_timeout(
+                                guard,
+                                std::time::Duration::from_micros(50),
+                            ).unwrap();
+                        }
+                    }
+                }
+                commits_done_out_ref.store(next_to_commit_fg, Ordering::Release);
+                drop(mat_tx);
+            });
+        });
+        
+        let final_num_txns = commits_done_out.load(Ordering::Acquire) as u32;
+
+        // ---------------------------------------------------------
+        // BLOCK EPILOGUE
+        // ---------------------------------------------------------
+        let mut maybe_block_epilogue_txn = None;
+        if let Some(block_id) = transaction_slice_metadata.append_state_checkpoint_to_block() {
+            if !has_reconfig.load(Ordering::Acquire) {
+                let epilogue_txn = self.gen_block_epilogue(
+                    block_id,
+                    signature_verified_block,
+                    final_results.acquire().dereference().iter().take(final_num_txns as usize),
+                    final_num_txns, 
+                    block_limit_processor.acquire().get_block_end_info(),
+                    environment.features(),
+                ).unwrap();
+
+                let block_epilogue_aux_info = A::new_empty();
+                let parallel_state = ParallelState::new(
+                    &versioned_cache,
+                    scheduler_wrapper.clone(),
+                    start_shared_counter,
+                    &shared_counter,
+                    0,
+                );
+                let sync_view = LatestView::new(
+                    base_view,
+                    module_cache_manager_guard.module_cache(),
+                    runtime_environment,
+                    ViewState::Sync(parallel_state),
+                    final_num_txns,
+                );
+
+                let epilogue_executor = E::init(&environment, base_view, async_runtime_checks_enabled);
+                let execution_result = epilogue_executor.execute_transaction(&sync_view, &epilogue_txn, &block_epilogue_aux_info, final_num_txns);
+                let mut read_set = sync_view.take_parallel_reads();
+                let (processed_output, _) = Self::process_execution_result(&execution_result, &mut read_set, final_num_txns).unwrap();
+                
+                Self::process_delayed_field_output(
+                    processed_output,
+                    final_num_txns,
+                    &mut read_set,
+                    &last_input_output,
+                    &versioned_cache,
+                    false,
+                ).unwrap();
+
+                if let Some(output) = processed_output {
+                    let output_before_guard = output.before_materialization().unwrap();
+                    for (k, (v, maybe_layout)) in output_before_guard.resource_write_set() {
+                        versioned_cache.data().write(k, final_num_txns, 0, v, maybe_layout).unwrap();
+                    }
+                }
+
+                last_input_output.record(
+                    final_num_txns,
+                    read_set,
+                    execution_result,
+                    &block_gas_limit_type,
+                    epilogue_txn.user_txn_bytes_len() as u64,
+                ).unwrap();
+
+                self.materialize_txn_commit(
+                    final_num_txns,
+                    scheduler_wrapper.clone(),
+                    environment,
+                    &shared_sync_params,
+                ).unwrap();
+                
+                self.record_finalized_output(final_num_txns, num_txns as TxnIndex, &shared_sync_params).unwrap();
+                maybe_block_epilogue_txn = Some(epilogue_txn);
+            } else {
+                final_results.acquire().dereference_mut().pop();
+            }
+        } else {
+            final_results.acquire().dereference_mut().pop();
+        }
+
+        counters::update_state_counters(versioned_cache.stats(), true);
+        module_cache_manager_guard.module_cache_mut().insert_verified(versioned_cache.take_modules_iter()).unwrap();
+        DEFAULT_DROPPER.schedule_drop((last_input_output, versioned_cache));
+        
+        let exec_time = _timer.stop_and_record();
+
+        println!("\n=======================================================");
+        println!("[PERFORMANCE METRICS] - DAG NATIVE ENGINE");
+        println!(" Block Size: {} txns", num_txns);
+        println!(" Total Execution Time: {} µs", (exec_time * 1_000_000.0) as u128);
+        println!("=======================================================\n");
+        eprintln!(
+            "[DAG-OVERHEAD] num_txns={} exec_scope_ms={} total_ms={}",
+            num_txns,
+            t_scope_start.elapsed().as_secs_f64() * 1000.0,
+            (exec_time * 1_000_000.0) as u128 / 1000,
+        );
+
+        Ok(BlockOutput::new(final_results.into_inner(), maybe_block_epilogue_txn))
+    }
+
     pub fn execute_block(
         &self,
         signature_verified_block: &TP,
         base_view: &S,
         transaction_slice_metadata: &TransactionSliceMetadata,
         module_cache_manager_guard: &mut AptosModuleCacheManagerGuard,
+        dag_schedule: Option<(Vec<Vec<usize>>, Vec<Vec<usize>>, Vec<usize>)>,
     ) -> BlockExecutionResult<BlockOutput<T, E::Output>, E::Error> {
         let _timer = BLOCK_EXECUTOR_INNER_EXECUTE_BLOCK.start_timer();
+
+        // ---------------------------------------------------------
+        // NATIVE DAG EXECUTION ROUTE
+        // ---------------------------------------------------------
+        if let Some((waves, out_edges, in_degrees)) = dag_schedule {
+            // println!("[EXECUTOR] Routing block to DAG Native Engine! (Waves: {})", waves.len());
+            let dag_result = self.execute_transactions_dag(
+                signature_verified_block,
+                base_view,
+                transaction_slice_metadata,
+                module_cache_manager_guard,
+                waves,
+                out_edges,
+                in_degrees,
+            );
+            if let Ok(output) = dag_result {
+                return Ok(output);
+            }
+        }
+        // ---------------------------------------------------------
 
         if self.config.local.concurrency_level > 1 {
             let parallel_result = if self.config.local.blockstm_v2 {

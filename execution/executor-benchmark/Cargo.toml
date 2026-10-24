@@ -55,6 +55,7 @@ clap = { workspace = true }
 dashmap = { workspace = true }
 derivative = { workspace = true }
 futures = { workspace = true }
+hex.workspace = true
 indicatif = { workspace = true }
 itertools = { workspace = true }
 move-core-types = { workspace = true }

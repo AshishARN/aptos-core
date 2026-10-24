@@ -3295,6 +3295,9 @@ impl AptosVMBlockExecutor {
             "Executing block, transaction count: {}", num_txns
         );
 
+        // ⏱️ START TIMER: Block-STM Execution
+        let block_start_time = std::time::Instant::now();
+
         let result = AptosVMBlockExecutorWrapper::execute_block::<
             _,
             NoOpTransactionCommitHook<VMStatus>,
@@ -3307,9 +3310,22 @@ impl AptosVMBlockExecutor {
             transaction_slice_metadata,
             None,
         );
+
+        // END TIMER: Block-STM Execution
+        let total_time = block_start_time.elapsed();
+
         if result.is_ok() {
             // Record the histogram count for transactions per block.
             BLOCK_TRANSACTION_COUNT.observe(num_txns as f64);
+
+            // // PRINT METRICS
+            // let block_id = format!("{:?}", state_view.id());
+            // println!("\n=======================================================");
+            // println!(" [PERFORMANCE METRICS] - (INSIDE execute_block_with_config)");
+            // println!(" Block ID: {}", block_id);
+            // println!(" Block Size: {} txns", num_txns);
+            // println!("  Total Block Execution Time: {} µs", total_time.as_micros());
+            // println!("=======================================================\n");
         }
         result
     }

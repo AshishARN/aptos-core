@@ -200,8 +200,8 @@ impl AptosModuleCacheManager {
         transaction_slice_metadata: TransactionSliceMetadata,
     ) -> Result<AptosModuleCacheManagerGuard<'_>, VMStatus> {
         // Get the current environment from storage.
-        let storage_environment =
-            AptosEnvironment::new_with_delayed_field_optimization_enabled(&state_view);
+        let storage_environment = AptosEnvironment::new_with_delayed_field_optimization_enabled(&state_view);
+        //let storage_environment = AptosEnvironment::new(state_view);
 
         Ok(match self.inner.try_lock() {
             Some(mut guard) => {

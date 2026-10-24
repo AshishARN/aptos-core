@@ -20,6 +20,8 @@ aptos-block-executor = { workspace = true }
 aptos-crypto = { workspace = true }
 aptos-crypto-derive = { workspace = true }
 aptos-experimental-runtimes = { workspace = true }
+dashmap = "5.5.3"
+aptos-framework = { workspace = true }
 aptos-framework-natives = { workspace = true }
 aptos-gas-algebra = { workspace = true }
 aptos-gas-meter = { workspace = true }

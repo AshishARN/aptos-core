@@ -105,6 +105,7 @@
 pub mod counters;
 pub mod data_cache;
 
+pub mod analyzer;
 pub mod aptos_vm;
 pub mod block_executor;
 mod errors;
